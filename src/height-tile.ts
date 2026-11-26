@@ -75,6 +75,39 @@ export class HeightTile {
   }
 
   /**
+   * Construct a height tile from values already computed: `data` holds every value from
+   * `-buffer, -buffer` to `width + buffer, height + buffer`, row by row. Anything further
+   * out is read from `outside`, which is `NaN` everywhere unless given.
+   */
+  static fromArray(
+    width: number,
+    height: number,
+    data: Float32Array,
+    buffer: number = 0,
+    outside: (x: number, y: number) => number = () => NaN,
+  ): HeightTile {
+    const stride = width + 2 * buffer;
+    if (data.length !== stride * (height + 2 * buffer)) {
+      throw new Error(
+        "data must hold (width + 2 * buffer) * (height + 2 * buffer) values",
+      );
+    }
+    const tile = new HeightTile(width, height, (x, y) =>
+      x >= -buffer && x < width + buffer && y >= -buffer && y < height + buffer
+        ? data[(y + buffer) * stride + x + buffer]
+        : outside(x, y),
+    );
+    tile.pixels = {
+      data,
+      offset: buffer * stride + buffer,
+      stride,
+      buffer,
+      raw: false,
+    };
+    return tile;
+  }
+
+  /**
    * Construct a height tile from a DEM tile plus it's 8 neighbors, so that
    * you can request `x` or `y` outside the bounds of the original tile.
    *
@@ -263,6 +296,16 @@ export class HeightTile {
       raw: false,
     };
     return tile;
+  };
+
+  /**
+   * Every value from `-buffer, -buffer` to `width + buffer, height + buffer`, row by row.
+   * The array may be the one this tile serves its values from, so treat it as read-only.
+   */
+  toArray = (buffer: number = 0): Float32Array => {
+    const pixels = this.materialize(buffer).pixels;
+    if (!pixels) throw new Error("materialize left no values");
+    return pixels.data;
   };
 
   private copyOwn(data: Float32Array, buffer: number): boolean {

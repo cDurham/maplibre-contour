@@ -269,3 +269,33 @@ test.each([
     );
   },
 );
+
+test.each([0, 1, 3])("toArray(%d) holds every value, row by row", (buffer) => {
+  const tile = HeightTile.combineNeighbors(randomNeighbors(8, 17));
+  expect(tile && Array.from(tile.toArray(buffer))).toEqual(
+    tile && values(tile, buffer),
+  );
+});
+
+test("toArray of a materialized tile is the array it serves from", () => {
+  const tile = HeightTile.combineNeighbors(randomNeighbors(8, 17))?.materialize(
+    2,
+  );
+  expect(tile?.toArray(2)).toBe(tile?.toArray(2));
+});
+
+test("fromArray serves the array inside its buffer and `outside` past it", () => {
+  const source = HeightTile.combineNeighbors(randomNeighbors(8, 19));
+  const data = source?.toArray(2) ?? new Float32Array();
+  const tile = HeightTile.fromArray(8, 8, data, 2, (x, y) => x * 100 + y);
+  expect(values(tile, 2)).toEqual(source && values(source, 2));
+  expect(tile.get(-3, 0)).toBe(-300);
+  expect(tile.get(0, 10)).toBe(10);
+  expect(HeightTile.fromArray(8, 8, data, 2).get(10, 0)).toBeNaN();
+  expect(tile.materialize(2)).toBe(tile);
+  expect(tile.toArray(2)).toBe(data);
+});
+
+test("fromArray refuses an array of the wrong size", () => {
+  expect(() => HeightTile.fromArray(8, 8, new Float32Array(64), 1)).toThrow();
+});
