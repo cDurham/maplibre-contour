@@ -141,17 +141,24 @@ function isWorker(): boolean {
   );
 }
 
+let selectedDecoder: typeof defaultDecoder | undefined;
+
 const defaultDecoder: (
   blob: Blob,
   encoding: Encoding,
   abortController: AbortController,
-) => Promise<DemTile> = shouldUseVideoFrame()
-  ? decodeImageVideoFrame
-  : offscreenCanvasSupported()
-    ? decodeImageModern
-    : isWorker()
-      ? decodeImageOnMainThread
-      : decodeImageOld;
+) => Promise<DemTile> = (blob, encoding, abortController) => {
+  if (!selectedDecoder) {
+    selectedDecoder = shouldUseVideoFrame()
+      ? decodeImageVideoFrame
+      : offscreenCanvasSupported()
+        ? decodeImageModern
+        : isWorker()
+          ? decodeImageOnMainThread
+          : decodeImageOld;
+  }
+  return selectedDecoder(blob, encoding, abortController);
+};
 
 export default defaultDecoder;
 
