@@ -181,13 +181,18 @@ export function decodeParsedImage(
   encoding: Encoding,
   input: Uint8ClampedArray,
 ): DemTile {
-  const decoder: (r: number, g: number, b: number) => number =
-    encoding === "mapbox"
-      ? (r, g, b) => -10000 + (r * 256 * 256 + g * 256 + b) * 0.1
-      : (r, g, b) => r * 256 + g + b / 256 - 32768;
   const data = new Float32Array(width * height);
-  for (let i = 0; i < input.length; i += 4) {
-    data[i / 4] = decoder(input[i], input[i + 1], input[i + 2]);
+  const pixels = Math.min(data.length, input.length >> 2);
+  if (encoding === "mapbox") {
+    for (let pixel = 0, i = 0; pixel < pixels; pixel++, i += 4) {
+      data[pixel] =
+        -10000 +
+        (input[i] * 256 * 256 + input[i + 1] * 256 + input[i + 2]) * 0.1;
+    }
+  } else {
+    for (let pixel = 0, i = 0; pixel < pixels; pixel++, i += 4) {
+      data[pixel] = input[i] * 256 + input[i + 1] + input[i + 2] / 256 - 32768;
+    }
   }
   return { width, height, data };
 }
