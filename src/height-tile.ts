@@ -257,20 +257,9 @@ export class HeightTile {
    * methods in the chain up to the root DEM tile.
    */
   materialize = (buffer: number = 2): HeightTile => {
+    if (this.ownArray(buffer)) return this;
     const stride = this.width + 2 * buffer;
-    const size = stride * (this.height + 2 * buffer);
-    const own = this.pixels;
-    if (
-      own &&
-      !own.raw &&
-      own.buffer === buffer &&
-      own.stride === stride &&
-      own.offset === buffer * stride + buffer &&
-      own.data.length === size
-    ) {
-      return this;
-    }
-    const data = new Float32Array(size);
+    const data = new Float32Array(stride * (this.height + 2 * buffer));
     if (
       !this.copyOwn(data, buffer) &&
       !this.copyNeighbors(data, buffer) &&
@@ -306,6 +295,23 @@ export class HeightTile {
     const pixels = this.materialize(buffer).pixels;
     if (!pixels) throw new Error("materialize left no values");
     return pixels.data;
+  };
+
+  /**
+   * The array this tile serves its values from, when that array is exactly every value
+   * from `-buffer, -buffer` to `width + buffer, height + buffer`, row by row.
+   */
+  ownArray = (buffer: number): Float32Array | undefined => {
+    const own = this.pixels;
+    const stride = this.width + 2 * buffer;
+    return own &&
+      !own.raw &&
+      own.buffer === buffer &&
+      own.stride === stride &&
+      own.offset === buffer * stride + buffer &&
+      own.data.length === stride * (this.height + 2 * buffer)
+      ? own.data
+      : undefined;
   };
 
   private copyOwn(data: Float32Array, buffer: number): boolean {

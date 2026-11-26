@@ -30,27 +30,52 @@ function pushPairsReversed(target: number[], source: number[]) {
   }
 }
 
+const NOWHERE = -1;
+const NO_EDGE = -2147483648;
+
+/**
+ * The line ends still waiting for the cell on their other side, for one elevation.
+ *
+ * The scan goes row by row, so a waiting end is either on the bottom edge of a cell, to be
+ * met by the cell below it, or on the right edge of the cell just scanned, to be met by the
+ * next. There is one slot per column for the first and one more for the second. A slot also
+ * keeps the edge it was written for, because the cell it waits for may be skipped.
+ */
+class Level {
+  endEdges: Int32Array;
+  ends: Fragment[];
+  startEdges: Int32Array;
+  starts: Fragment[];
+  fragments: Fragment[] = [];
+
+  constructor(slots: number) {
+    this.endEdges = new Int32Array(slots).fill(NO_EDGE);
+    this.ends = new Array(slots);
+    this.startEdges = new Int32Array(slots).fill(NO_EDGE);
+    this.starts = new Array(slots);
+  }
+}
+
 class Fragment {
   start: number;
   end: number;
+  /** Where `end` is kept in its level's `ends`, or `NOWHERE`. */
+  endSlot: number;
+  /** When `start` was last set: the order unfinished lines come out in. */
+  order: number;
+  /** False once the line has closed into a ring or been joined onto another. */
+  open: boolean;
   prepended: number[];
   appended: number[];
 
-  constructor(start: number, end: number) {
+  constructor(start: number, end: number, order: number) {
     this.start = start;
     this.end = end;
+    this.endSlot = NOWHERE;
+    this.order = order;
+    this.open = true;
     this.prepended = [];
     this.appended = [];
-    this.append = this.append.bind(this);
-    this.prepend = this.prepend.bind(this);
-  }
-
-  append(x: number, y: number) {
-    this.appended.push(Math.round(x), Math.round(y));
-  }
-
-  prepend(x: number, y: number) {
-    this.prepended.push(Math.round(x), Math.round(y));
   }
 
   lineString() {
@@ -197,6 +222,70 @@ function ratio(a: number, b: number, c: number) {
 }
 
 /**
+ * Adds to `points` where the contour at `threshold` crosses the edge `point` of the cell
+ * whose bottom-right corner is at column `c`, row `r`.
+ */
+function cross(
+  points: number[],
+  point: [number, number],
+  threshold: number,
+  multiplier: number,
+  c: number,
+  r: number,
+  tld: number,
+  trd: number,
+  bld: number,
+  brd: number,
+) {
+  if (point[0] === 0) {
+    // left
+    points.push(
+      Math.round(multiplier * (c - 1)),
+      Math.round(multiplier * (r - ratio(bld, threshold, tld))),
+    );
+  } else if (point[0] === 2) {
+    // right
+    points.push(
+      Math.round(multiplier * c),
+      Math.round(multiplier * (r - ratio(brd, threshold, trd))),
+    );
+  } else if (point[1] === 0) {
+    // top
+    points.push(
+      Math.round(multiplier * (c - ratio(trd, threshold, tld))),
+      Math.round(multiplier * (r - 1)),
+    );
+  } else {
+    // bottom
+    points.push(
+      Math.round(multiplier * (c - ratio(brd, threshold, bld))),
+      Math.round(multiplier * r),
+    );
+  }
+}
+
+/**
+ * Every value the scan reads, row by row from `-buffer, -buffer`: the tile's own array when
+ * it has been materialized to this buffer, and otherwise each value read once, as it is.
+ */
+function heightsOf(
+  tile: HeightTile,
+  buffer: number,
+): Float32Array | Float64Array {
+  const own = tile.ownArray(buffer);
+  if (own) return own;
+  const stride = tile.width + 2 * buffer;
+  const heights = new Float64Array(stride * (tile.height + 2 * buffer));
+  let idx = 0;
+  for (let y = -buffer; y < tile.height + buffer; y++) {
+    for (let x = -buffer; x < tile.width + buffer; x++) {
+      heights[idx++] = tile.get(x, y);
+    }
+  }
+  return heights;
+}
+
+/**
  * Generates contour lines from a HeightTile
  *
  * @param interval Vertical distance between contours
@@ -215,52 +304,35 @@ export default function generateIsolines(
   if (!interval) {
     return {};
   }
-  const multiplier = extent / (tile.width - 1);
+  const width = tile.width;
+  const multiplier = extent / (width - 1);
+  const stride = width + 2 * buffer;
+  const origin = buffer * stride + buffer;
+  const heights = heightsOf(tile, buffer);
   let tld: number, trd: number, bld: number, brd: number;
-  let r: number, c: number;
   const segments: { [ele: string]: number[][] } = {};
-  const fragmentByStartByLevel: Map<number, Map<number, Fragment>> = new Map();
-  const fragmentByEndByLevel: Map<number, Map<number, Fragment>> = new Map();
-
-  function interpolate(
-    point: [number, number],
-    threshold: number,
-    accept: (x: number, y: number) => void,
-  ) {
-    if (point[0] === 0) {
-      // left
-      accept(
-        multiplier * (c - 1),
-        multiplier * (r - ratio(bld, threshold, tld)),
-      );
-    } else if (point[0] === 2) {
-      // right
-      accept(multiplier * c, multiplier * (r - ratio(brd, threshold, trd)));
-    } else if (point[1] === 0) {
-      // top
-      accept(
-        multiplier * (c - ratio(trd, threshold, tld)),
-        multiplier * (r - 1),
-      );
-    } else {
-      // bottom
-      accept(multiplier * (c - ratio(brd, threshold, bld)), multiplier * r);
-    }
-  }
+  const levels: Map<number, Level> = new Map();
+  const columnSlot = buffer - 1;
+  const sideSlot = width + 2 * buffer - 1;
+  let threshold = NaN;
+  let level = new Level(0);
+  let order = 0;
 
   // Most marching-squares implementations (d3-contour, gdal-contour) make one pass through the matrix per threshold.
   // This implementation makes a single pass through the matrix, building up all of the contour lines at the
   // same time to improve performance.
-  for (r = 1 - buffer; r < tile.height + buffer; r++) {
-    trd = tile.get(0, r - 1);
-    brd = tile.get(0, r);
+  for (let r = 1 - buffer; r < tile.height + buffer; r++) {
+    const above = origin + (r - 1) * stride;
+    const below = origin + r * stride;
+    trd = heights[above];
+    brd = heights[below];
     let minR = Math.min(trd, brd);
     let maxR = Math.max(trd, brd);
-    for (c = 1 - buffer; c < tile.width + buffer; c++) {
+    for (let c = 1 - buffer; c < width + buffer; c++) {
       tld = trd;
       bld = brd;
-      trd = tile.get(c, r - 1);
-      brd = tile.get(c, r);
+      trd = heights[above + c];
+      brd = heights[below + c];
       const minL = minR;
       const maxL = maxR;
       minR = Math.min(trd, brd);
@@ -272,77 +344,116 @@ export default function generateIsolines(
       const max = Math.max(maxL, maxR);
       const start = Math.ceil(min / interval) * interval;
       const end = Math.floor(max / interval) * interval;
-      for (let threshold = start; threshold <= end; threshold += interval) {
-        const tl = tld > threshold;
-        const tr = trd > threshold;
-        const bl = bld > threshold;
-        const br = brd > threshold;
-        for (const segment of CASES[
-          (tl ? 8 : 0) | (tr ? 4 : 0) | (br ? 2 : 0) | (bl ? 1 : 0)
-        ]) {
-          let fragmentByStart = fragmentByStartByLevel.get(threshold);
-          if (!fragmentByStart)
-            fragmentByStartByLevel.set(
-              threshold,
-              (fragmentByStart = new Map()),
-            );
-          let fragmentByEnd = fragmentByEndByLevel.get(threshold);
-          if (!fragmentByEnd)
-            fragmentByEndByLevel.set(threshold, (fragmentByEnd = new Map()));
+      for (let t = start; t <= end; t += interval) {
+        const tl = tld > t;
+        const tr = trd > t;
+        const bl = bld > t;
+        const br = brd > t;
+        const cellSegments =
+          CASES[(tl ? 8 : 0) | (tr ? 4 : 0) | (br ? 2 : 0) | (bl ? 1 : 0)];
+        for (let s = 0; s < cellSegments.length; s++) {
+          const segment = cellSegments[s];
+          if (t !== threshold) {
+            threshold = t;
+            let found = levels.get(t);
+            if (!found) levels.set(t, (found = new Level(sideSlot + 1)));
+            level = found;
+          }
           const start = segment[0];
           const end = segment[1];
-          const startIndex = index(tile.width, c, r, start);
-          const endIndex = index(tile.width, c, r, end);
-          let f, g;
+          const startIndex = index(width, c, r, start);
+          const endIndex = index(width, c, r, end);
+          const startSlot = start[0] === 1 ? c + columnSlot : sideSlot;
+          const endSlot = end[0] === 1 ? c + columnSlot : sideSlot;
+          // only a bottom or a right edge has a cell still to come on its other side
+          const startWaits = start[0] === 2 || start[1] === 2;
+          const endWaits = end[0] === 2 || end[1] === 2;
+          let f: Fragment | undefined, g: Fragment | undefined;
 
-          if ((f = fragmentByEnd.get(startIndex))) {
-            fragmentByEnd.delete(startIndex);
-            if ((g = fragmentByStart.get(endIndex))) {
-              fragmentByStart.delete(endIndex);
+          if (level.endEdges[startSlot] === startIndex) {
+            f = level.ends[startSlot];
+            level.endEdges[startSlot] = NO_EDGE;
+            if (level.startEdges[endSlot] === endIndex) {
+              g = level.starts[endSlot];
+              level.startEdges[endSlot] = NO_EDGE;
               if (f === g) {
                 // closing a ring
-                interpolate(end, threshold, f.append);
+                cross(f.appended, end, t, multiplier, c, r, tld, trd, bld, brd);
+                f.open = false;
                 if (!f.isEmpty()) {
-                  let list = segments[threshold];
+                  let list = segments[t];
                   if (!list) {
-                    segments[threshold] = list = [];
+                    segments[t] = list = [];
                   }
                   list.push(f.lineString());
                 }
               } else {
                 // connecting 2 segments
                 f.appendFragment(g);
-                fragmentByEnd.set((f.end = g.end), f);
+                g.open = false;
+                f.end = g.end;
+                f.endSlot = g.endSlot;
+                if (
+                  f.endSlot !== NOWHERE &&
+                  level.endEdges[f.endSlot] === f.end
+                ) {
+                  level.ends[f.endSlot] = f;
+                }
               }
             } else {
               // adding to the end of f
-              interpolate(end, threshold, f.append);
-              fragmentByEnd.set((f.end = endIndex), f);
+              cross(f.appended, end, t, multiplier, c, r, tld, trd, bld, brd);
+              f.end = endIndex;
+              if (endWaits) {
+                f.endSlot = endSlot;
+                level.endEdges[endSlot] = endIndex;
+                level.ends[endSlot] = f;
+              } else {
+                f.endSlot = NOWHERE;
+              }
             }
-          } else if ((f = fragmentByStart.get(endIndex))) {
-            fragmentByStart.delete(endIndex);
+          } else if (level.startEdges[endSlot] === endIndex) {
+            f = level.starts[endSlot];
+            level.startEdges[endSlot] = NO_EDGE;
             // extending the start of f
-            interpolate(start, threshold, f.prepend);
-            fragmentByStart.set((f.start = startIndex), f);
+            cross(f.prepended, start, t, multiplier, c, r, tld, trd, bld, brd);
+            f.start = startIndex;
+            f.order = order++;
+            if (startWaits) {
+              level.startEdges[startSlot] = startIndex;
+              level.starts[startSlot] = f;
+            }
           } else {
             // starting a new fragment
-            const newFrag = new Fragment(startIndex, endIndex);
-            interpolate(start, threshold, newFrag.append);
-            interpolate(end, threshold, newFrag.append);
-            fragmentByStart.set(startIndex, newFrag);
-            fragmentByEnd.set(endIndex, newFrag);
+            const newFrag = new Fragment(startIndex, endIndex, order++);
+            level.fragments.push(newFrag);
+            const points = newFrag.appended;
+            cross(points, start, t, multiplier, c, r, tld, trd, bld, brd);
+            cross(points, end, t, multiplier, c, r, tld, trd, bld, brd);
+            if (startWaits) {
+              level.startEdges[startSlot] = startIndex;
+              level.starts[startSlot] = newFrag;
+            }
+            if (endWaits) {
+              newFrag.endSlot = endSlot;
+              level.endEdges[endSlot] = endIndex;
+              level.ends[endSlot] = newFrag;
+            }
           }
         }
       }
     }
   }
 
-  for (const [level, fragmentByStart] of fragmentByStartByLevel.entries()) {
+  for (const [ele, { fragments }] of levels.entries()) {
     let list: number[][] | null = null;
-    for (const value of fragmentByStart.values()) {
+    const unfinished = fragments
+      .filter((fragment) => fragment.open)
+      .sort((a, b) => a.order - b.order);
+    for (const value of unfinished) {
       if (!value.isEmpty()) {
         if (list == null) {
-          list = segments[level] || (segments[level] = []);
+          list = segments[ele] || (segments[ele] = []);
         }
         list.push(value.lineString());
       }
