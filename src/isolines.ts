@@ -57,7 +57,7 @@ class Fragment {
   }
 }
 
-const CASES: [number, number][][][] = [
+export const CASES: [number, number][][][] = [
   [],
   [
     [
