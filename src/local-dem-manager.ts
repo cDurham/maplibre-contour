@@ -1,6 +1,7 @@
 import AsyncCache from "./cache";
 import defaultDecodeImage from "./decode-image";
 import { HeightTile } from "./height-tile";
+import { heightGrid } from "./height-grid";
 import generateIsolines from "./isolines";
 import { copy, encodeIndividualOptions, isAborted, withTimeout } from "./utils";
 import type {
@@ -276,24 +277,13 @@ export class LocalDemManager implements DemManager {
           childAbortController,
           timer,
         );
-        let virtualTile = HeightTile.combineNeighbors(neighbors);
-        if (!virtualTile || isAborted(childAbortController)) {
+        const dem = HeightTile.combineNeighbors(neighbors);
+        if (!dem || isAborted(childAbortController)) {
           return { arrayBuffer: new Uint8Array().buffer };
         }
         const mark = timer?.marker("isoline");
 
-        if (virtualTile.width >= subsampleBelow) {
-          virtualTile = virtualTile.materialize(2);
-        } else {
-          while (virtualTile.width < subsampleBelow) {
-            virtualTile = virtualTile.subsamplePixelCenters(2).materialize(2);
-          }
-        }
-
-        virtualTile = virtualTile
-          .averagePixelCentersToGrid()
-          .scaleElevation(multiplier)
-          .materialize(1);
+        const virtualTile = heightGrid(dem, subsampleBelow, multiplier);
 
         const isolines = generateIsolines(
           levels[0],
