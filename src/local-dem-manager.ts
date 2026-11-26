@@ -4,7 +4,7 @@ import { HeightTile } from "./height-tile";
 import {
   demTilesRead,
   demTilesUnderNeighbors,
-  heightGrid,
+  heightGridUnlessEmpty,
 } from "./height-grid";
 import type { DemWindow } from "./height-grid";
 import generateIsolines from "./isolines";
@@ -306,14 +306,16 @@ export class LocalDemManager implements DemManager {
         }
         const mark = timer?.marker("isoline");
 
-        const virtualTile = heightGrid(window, subsampleBelow, multiplier);
-
-        const isolines = generateIsolines(
+        const virtualTile = heightGridUnlessEmpty(
+          window,
+          subsampleBelow,
+          multiplier,
           levels[0],
-          virtualTile,
-          extent,
-          buffer,
         );
+
+        const isolines = virtualTile
+          ? generateIsolines(levels[0], virtualTile, extent, buffer)
+          : {};
 
         mark?.();
         const result = encodeVectorTile({

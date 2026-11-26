@@ -29,6 +29,7 @@ export interface GridLayout {
 
 const CENTER = 4;
 const GRID_BORDER = 1;
+const FLOAT32_ROUNDING_SLACK = 2 ** -20;
 
 export function heightGrid(
   window: DemWindow,
@@ -43,6 +44,26 @@ export function heightGrid(
         multiplier,
       )
     : gridByClosureChain(demByClosures(window), subsampleBelow, multiplier);
+}
+
+export function heightGridUnlessEmpty(
+  window: DemWindow,
+  subsampleBelow: number,
+  multiplier: number,
+  interval: number,
+): HeightTile | undefined {
+  const layout = gridLayout(window, subsampleBelow);
+  if (!layout) {
+    return gridByClosureChain(
+      demByClosures(window),
+      subsampleBelow,
+      multiplier,
+    );
+  }
+  const pixels = demPixelsUnderLayout(window, layout);
+  return convexHullHoldsNoLevel(pixels, multiplier, interval)
+    ? undefined
+    : gridOverDemPixels(layout, pixels, multiplier);
 }
 
 function demPixelsUnderLayout(
@@ -78,6 +99,39 @@ function gridOverDemPixels(
     rows.first + GRID_BORDER,
     layout.cellsAcross + 1,
     layout.cellsDown + 1,
+  );
+}
+
+export function convexHullHoldsNoLevel(
+  pixels: HeightBlock,
+  multiplier: number,
+  interval: number,
+): boolean {
+  const { data } = pixels;
+  let lowest = Infinity;
+  let highest = -Infinity;
+  for (let i = 0; i < data.length; i++) {
+    const value = data[i];
+    if (value < lowest) {
+      lowest = value;
+    }
+    if (value > highest) {
+      highest = value;
+    }
+  }
+  if (lowest > highest) {
+    return true;
+  }
+  if (!(interval > 0)) {
+    return false;
+  }
+  const one = lowest * multiplier;
+  const other = highest * multiplier;
+  const slack =
+    Math.max(Math.abs(one), Math.abs(other)) * FLOAT32_ROUNDING_SLACK;
+  return (
+    Math.ceil((Math.min(one, other) - slack) / interval) >
+    Math.floor((Math.max(one, other) + slack) / interval)
   );
 }
 

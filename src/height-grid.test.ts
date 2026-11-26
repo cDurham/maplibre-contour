@@ -1,6 +1,7 @@
 import { HeightTile } from "./height-tile";
 import {
   chaikinDoublePixels,
+  convexHullHoldsNoLevel,
   demByClosures,
   demPixelsUnderGrid,
   demTilesRead,
@@ -11,11 +12,13 @@ import {
   gridByQuadraticBSpline,
   gridLayout,
   heightGrid,
+  heightGridUnlessEmpty,
   meanOfFourPixelsAtCorners,
   pixelsChaikinDoublingReads,
   upsamplingFactor,
 } from "./height-grid";
 import type { DemWindow, GridLayout, HeightBlock, Span } from "./height-grid";
+import generateIsolines from "./isolines";
 import type { DemTile } from "./types";
 
 type Pixels = (x: number, y: number) => number;
@@ -530,6 +533,110 @@ describe("the DEM tiles a window reads", () => {
   test("a window that takes the chain of closures reads the DEM tiles under its neighbors", () => {
     const window = windowAround(rough, [], 1, 1, 0, 3);
     expect(demTilesRead(window, 1)).toEqual(demTilesUnderNeighbors(1, 1, 0));
+  });
+});
+
+describe("convexHullHoldsNoLevel", () => {
+  const block = (...values: number[]): HeightBlock => ({
+    columns: { first: 0, count: values.length },
+    rows: { first: 0, count: 1 },
+    data: Float32Array.from(values),
+  });
+
+  test("pixels between two levels hold no level", () => {
+    expect(convexHullHoldsNoLevel(block(101, 105, 109), 1, 10)).toBe(true);
+  });
+
+  test("pixels on both sides of a level hold it", () => {
+    expect(convexHullHoldsNoLevel(block(99, 101), 1, 10)).toBe(false);
+  });
+
+  test("pixels exactly on a level hold it", () => {
+    expect(convexHullHoldsNoLevel(block(100, 100), 1, 10)).toBe(false);
+  });
+
+  test("a pixel within 32 bit float rounding of a level holds it", () => {
+    expect(convexHullHoldsNoLevel(block(99.99999, 95), 1, 100)).toBe(false);
+    expect(convexHullHoldsNoLevel(block(99.99, 95), 1, 100)).toBe(true);
+  });
+
+  test("missing pixels are left out, and no pixels hold no level", () => {
+    expect(convexHullHoldsNoLevel(block(101, NaN, 109), 1, 10)).toBe(true);
+    expect(convexHullHoldsNoLevel(block(NaN, NaN), 1, 10)).toBe(true);
+  });
+
+  test("levels are in the units the multiplier converts to", () => {
+    expect(convexHullHoldsNoLevel(block(30, 30.4), FEET, 100)).toBe(true);
+    expect(convexHullHoldsNoLevel(block(30.4, 30.5), FEET, 100)).toBe(false);
+    expect(convexHullHoldsNoLevel(block(101, 109), -1, 10)).toBe(true);
+    expect(convexHullHoldsNoLevel(block(99, 101), -1, 10)).toBe(false);
+  });
+
+  test("an interval that is not positive is never ruled out", () => {
+    expect(convexHullHoldsNoLevel(block(101, 109), 1, 0)).toBe(false);
+    expect(convexHullHoldsNoLevel(block(101, 109), 1, NaN)).toBe(false);
+  });
+});
+
+describe("heightGridUnlessEmpty", () => {
+  const gentle =
+    (rise: number): Pixels =>
+    (x, y) =>
+      100 + (rough(x, y) * rise) / 1024;
+  let ruledOut = 0;
+  let traced = 0;
+
+  describe.each([
+    ["rising 3", gentle(3)],
+    ["rising 12", gentle(12)],
+    ["rising 40", gentle(40)],
+    ["rising 12 with holes", withHoles(gentle(12))],
+  ] as [string, Pixels][])("%s", (_, pixels) => {
+    test.each([
+      [0, 1],
+      [0, 4],
+      [1, 32],
+      [3, 8],
+      [4, 16],
+    ])(
+      "at depth %d upsampled %dx is heightGrid, or nothing where heightGrid traces no line",
+      (depth, factor) => {
+        const subsampleBelow = (WIDTH / 2 ** depth) * factor;
+        for (let row = 0; row < 2 ** depth; row++) {
+          for (let column = 0; column < 2 ** depth; column++) {
+            const window = windowAround(pixels, [], depth, column, row);
+            for (const multiplier of [1, FEET, -1]) {
+              const grid = heightGrid(window, subsampleBelow, multiplier);
+              for (const interval of [5, 10, 25]) {
+                const unlessEmpty = heightGridUnlessEmpty(
+                  window,
+                  subsampleBelow,
+                  multiplier,
+                  interval,
+                );
+                if (unlessEmpty) {
+                  expect(valuesOf(unlessEmpty, 1)).toEqual(valuesOf(grid, 1));
+                  traced++;
+                } else {
+                  expect(generateIsolines(interval, grid, 4096, 1)).toEqual({});
+                  ruledOut++;
+                }
+              }
+            }
+          }
+        }
+      },
+    );
+  });
+
+  test("both outcomes were exercised", () => {
+    expect(ruledOut).toBeGreaterThan(100);
+    expect(traced).toBeGreaterThan(100);
+  });
+
+  test("a window that takes the chain of closures is never ruled out", () => {
+    const window = windowAround(() => 101, [], 1, 1, 0, 3);
+    expect(heightGridUnlessEmpty(window, 1, 1, 10)).toBeDefined();
   });
 });
 

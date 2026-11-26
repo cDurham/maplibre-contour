@@ -543,3 +543,31 @@ test("fetchContourTile fetches the DEM tiles a window narrower than two pixels r
   ]);
   expect(contourTile.arrayBuffer.byteLength).toBeGreaterThan(0);
 });
+
+test("fetchContourTile gives a layer with no lines where the DEM crosses no level", async () => {
+  const demManager = new LocalDemManager({
+    demUrlPattern: "https://example/{z}/{x}/{y}.png",
+    cacheSize: 100,
+    encoding: "terrarium",
+    maxzoom: 12,
+    timeoutMs: 10000,
+    decodeImage: async () => ({
+      width: 4,
+      height: 4,
+      data: new Float32Array(16).fill(5),
+    }),
+    getTile: jest.fn().mockResolvedValue({ data: new Blob([]) }),
+  });
+  for (const z of [12, 14]) {
+    const contourTile = await demManager.fetchContourTile(
+      z,
+      2048,
+      2048,
+      { levels: [10] },
+      new AbortController(),
+    );
+    expect(Buffer.from(contourTile.arrayBuffer).toString("hex")).toBe(
+      "1a0f0a08636f6e746f7572732880207802",
+    );
+  }
+});
