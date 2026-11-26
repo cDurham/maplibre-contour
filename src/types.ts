@@ -1,3 +1,4 @@
+import type { HeightTile } from "./height-tile";
 import type Actor from "./actor";
 import type { Timer } from "./performance";
 import type WorkerDispatch from "./worker-dispatch";
@@ -166,7 +167,13 @@ export type DemManagerInitizlizationParameters =
     decodeImage?: DecodeImageFunction;
     getTile?: GetTileFunction;
     actor?: Actor<WorkerDispatch>;
+    /** Applied to the elevation a contour tile is traced from: the tile and its eight neighbours, as one. */
+    transformHeights?: (tile: HeightTile) => HeightTile;
+    /** Applied to the lines traced, keyed by elevation, before they are encoded in a tile this wide. */
+    transformIsolines?: (isolines: Isolines, extent: number) => Isolines;
   };
+
+export type Isolines = { [ele: number]: number[][] };
 
 export type InitMessage = DemManagerRequiredInitializationParameters & {
   managerId: number;

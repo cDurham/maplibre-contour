@@ -13,6 +13,7 @@ import type {
   FetchResponse,
   GetTileFunction,
   IndividualContourTileOptions,
+  Isolines,
 } from "./types";
 import encodeVectorTile, { GeomType } from "./vtpbf";
 import { Timer } from "./performance";
@@ -62,6 +63,8 @@ export class LocalDemManager implements DemManager {
   loaded = Promise.resolve();
   decodeImage: DecodeImageFunction;
   getTile: GetTileFunction;
+  transformHeights: (tile: HeightTile) => HeightTile;
+  transformIsolines: (isolines: Isolines, extent: number) => Isolines;
 
   constructor(options: DemManagerInitizlizationParameters) {
     this.tileCache = new AsyncCache(options.cacheSize);
@@ -75,6 +78,9 @@ export class LocalDemManager implements DemManager {
     this.sparse = options.sparse ?? false;
     this.decodeImage = options.decodeImage || defaultDecodeImage;
     this.getTile = options.getTile || defaultGetTile;
+    this.transformHeights = options.transformHeights || ((tile) => tile);
+    this.transformIsolines =
+      options.transformIsolines || ((isolines) => isolines);
   }
 
   fetchTile(
@@ -280,6 +286,7 @@ export class LocalDemManager implements DemManager {
         if (!virtualTile || isAborted(childAbortController)) {
           return { arrayBuffer: new Uint8Array().buffer };
         }
+        virtualTile = this.transformHeights(virtualTile);
         const mark = timer?.marker("isoline");
 
         if (virtualTile.width >= subsampleBelow) {
@@ -295,11 +302,9 @@ export class LocalDemManager implements DemManager {
           .scaleElevation(multiplier)
           .materialize(1);
 
-        const isolines = generateIsolines(
-          levels[0],
-          virtualTile,
+        const isolines = this.transformIsolines(
+          generateIsolines(levels[0], virtualTile, extent, buffer),
           extent,
-          buffer,
         );
 
         mark?.();
