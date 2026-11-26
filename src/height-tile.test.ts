@@ -235,3 +235,37 @@ test.each([
     expect(fast && values(fast, buffer)).toEqual(slow && values(slow, buffer));
   },
 );
+
+test.each([0, 1, 2, 3])(
+  "materialize(%d) of a tile materialized with buffer 3 matches reading each pixel",
+  (buffer) => {
+    const source = HeightTile.combineNeighbors(
+      randomNeighbors(8, 5),
+    )?.materialize(3);
+    const fast = source?.materialize(buffer);
+    const slow = source && plain(source).materialize(buffer);
+    expect(fast && values(fast, buffer)).toEqual(slow && values(slow, buffer));
+  },
+);
+
+test("materialize of a tile already materialized with that buffer is the tile", () => {
+  const source = HeightTile.combineNeighbors(
+    randomNeighbors(8, 5),
+  )?.materialize(2);
+  expect(source?.materialize(2)).toBe(source);
+  expect(source?.materialize(1)).not.toBe(source);
+});
+
+test.each([
+  [0, 0, 0],
+  [1, 1, 0],
+  [2, 3, 1],
+])(
+  "materialize a raw tile split %d/%d/%d matches reading each pixel",
+  (z, x, y) => {
+    const tile = HeightTile.fromRawDem(randomDem(16, 13)).split(z, x, y);
+    expect(values(tile.materialize(0), 0)).toEqual(
+      values(plain(tile).materialize(0), 0),
+    );
+  },
+);

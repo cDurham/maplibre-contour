@@ -225,8 +225,24 @@ export class HeightTile {
    */
   materialize = (buffer: number = 2): HeightTile => {
     const stride = this.width + 2 * buffer;
-    const data = new Float32Array(stride * (this.height + 2 * buffer));
-    if (!this.copyNeighbors(data, buffer) && !this.fillAverage(data, buffer)) {
+    const size = stride * (this.height + 2 * buffer);
+    const own = this.pixels;
+    if (
+      own &&
+      !own.raw &&
+      own.buffer === buffer &&
+      own.stride === stride &&
+      own.offset === buffer * stride + buffer &&
+      own.data.length === size
+    ) {
+      return this;
+    }
+    const data = new Float32Array(size);
+    if (
+      !this.copyOwn(data, buffer) &&
+      !this.copyNeighbors(data, buffer) &&
+      !this.fillAverage(data, buffer)
+    ) {
       let idx = 0;
       for (let y = -buffer; y < this.height + buffer; y++) {
         for (let x = -buffer; x < this.width + buffer; x++) {
@@ -248,6 +264,18 @@ export class HeightTile {
     };
     return tile;
   };
+
+  private copyOwn(data: Float32Array, buffer: number): boolean {
+    const pixels = this.pixels;
+    if (!pixels || buffer > pixels.buffer) return false;
+    const length = this.width + 2 * buffer;
+    let idx = 0;
+    for (let y = -buffer; y < this.height + buffer; y++) {
+      copyRow(pixels, -buffer, y, length, data, idx);
+      idx += length;
+    }
+    return true;
+  }
 
   private copyNeighbors(data: Float32Array, buffer: number): boolean {
     const { neighbors, width, height } = this;
