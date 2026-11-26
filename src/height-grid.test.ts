@@ -12,7 +12,7 @@ import {
   gridByQuadraticBSpline,
   gridLayout,
   heightGrid,
-  heightGridUnlessEmpty,
+  tileHeightsUnlessEmpty,
   meanOfFourPixelsAtCorners,
   pixelsChaikinDoublingReads,
   upsamplingFactor,
@@ -578,7 +578,7 @@ describe("convexHullHoldsNoLevel", () => {
   });
 });
 
-describe("heightGridUnlessEmpty", () => {
+describe("tileHeightsUnlessEmpty", () => {
   const gentle =
     (rise: number): Pixels =>
     (x, y) =>
@@ -599,7 +599,7 @@ describe("heightGridUnlessEmpty", () => {
       [3, 8],
       [4, 16],
     ])(
-      "at depth %d upsampled %dx is heightGrid, or nothing where heightGrid traces no line",
+      "at depth %d upsampled %dx is heightGrid, or nothing where heightGrid holds no line",
       (depth, factor) => {
         const subsampleBelow = (WIDTH / 2 ** depth) * factor;
         for (let row = 0; row < 2 ** depth; row++) {
@@ -608,14 +608,19 @@ describe("heightGridUnlessEmpty", () => {
             for (const multiplier of [1, FEET, -1]) {
               const grid = heightGrid(window, subsampleBelow, multiplier);
               for (const interval of [5, 10, 25]) {
-                const unlessEmpty = heightGridUnlessEmpty(
+                const tileHeights = tileHeightsUnlessEmpty(
                   window,
-                  subsampleBelow,
+                  layoutOf(window, subsampleBelow),
                   multiplier,
                   interval,
                 );
-                if (unlessEmpty) {
-                  expect(valuesOf(unlessEmpty, 1)).toEqual(valuesOf(grid, 1));
+                if (tileHeights) {
+                  expect(tileHeights.cells).toBe(grid.width - 1);
+                  expect(tileHeights.heights).toMatchObject({
+                    columns: { first: -1, count: grid.width + 2 },
+                    rows: { first: -1, count: grid.height + 2 },
+                  });
+                  expect(tileHeights.heights.data).toEqual(valuesOf(grid, 1));
                   traced++;
                 } else {
                   expect(generateIsolines(interval, grid, 4096, 1)).toEqual({});
@@ -634,10 +639,45 @@ describe("heightGridUnlessEmpty", () => {
     expect(traced).toBeGreaterThan(100);
   });
 
-  test("a window that takes the chain of closures is never ruled out", () => {
-    const window = windowAround(() => 101, [], 1, 1, 0, 3);
-    expect(heightGridUnlessEmpty(window, 1, 1, 10)).toBeDefined();
-  });
+  test.each([0, 2, 3])(
+    "with a border of %d grid points it is the same part of the whole DEM tile's grid",
+    (border) => {
+      const pixels = withHoles(rough);
+      for (const [depth, factor] of [
+        [2, 8],
+        [3, 16],
+        [4, 32],
+      ]) {
+        const cells = (WIDTH / 2 ** depth) * factor;
+        const whole = heightGrid(
+          windowAround(pixels, [5]),
+          WIDTH * factor,
+          FEET,
+        );
+        const window = windowAround(pixels, [5], depth, 1, 2);
+        const tileHeights = tileHeightsUnlessEmpty(
+          window,
+          gridLayout(window, cells, border) as GridLayout,
+          FEET,
+          1,
+        );
+        const expected: number[] = [];
+        for (let y = -border; y <= cells + border; y++) {
+          for (let x = -border; x <= cells + border; x++) {
+            expected.push(whole.get(cells + x, 2 * cells + y));
+          }
+        }
+        expect(tileHeights).toEqual({
+          cells,
+          heights: {
+            columns: { first: -border, count: cells + 1 + 2 * border },
+            rows: { first: -border, count: cells + 1 + 2 * border },
+            data: Float32Array.from(expected),
+          },
+        });
+      }
+    },
+  );
 });
 
 describe("the surface in plain numbers", () => {

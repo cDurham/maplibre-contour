@@ -2,12 +2,16 @@ import AsyncCache from "./cache";
 import defaultDecodeImage from "./decode-image";
 import { HeightTile } from "./height-tile";
 import {
+  demByClosures,
   demTilesRead,
   demTilesUnderNeighbors,
-  heightGridUnlessEmpty,
+  gridByClosureChain,
+  gridLayout,
+  tileHeightsUnlessEmpty,
 } from "./height-grid";
-import type { DemWindow } from "./height-grid";
 import generateIsolines from "./isolines";
+import type { DemWindow } from "./height-grid";
+import { followContours, linesByElevation } from "./contour-follower";
 import { copy, encodeIndividualOptions, isAborted, withTimeout } from "./utils";
 import type {
   ContourTile,
@@ -185,6 +189,7 @@ export class LocalDemManager implements DemManager {
     x: number,
     y: number,
     subsampleBelow: number,
+    border: number,
     abortController: AbortController,
     timer?: Timer,
   ): Promise<DemWindow> {
@@ -224,7 +229,7 @@ export class LocalDemManager implements DemManager {
       );
     await fetchTiles(demTilesUnderNeighbors(depth, window.column, window.row));
     if (window.tiles[4]) {
-      await fetchTiles(demTilesRead(window, subsampleBelow));
+      await fetchTiles(demTilesRead(window, subsampleBelow, border));
       return window;
     }
     if (!this.sparse || zoom <= this.minzoom || isAborted(abortController)) {
@@ -236,6 +241,7 @@ export class LocalDemManager implements DemManager {
       x,
       y,
       subsampleBelow,
+      border,
       abortController,
       timer,
     );
@@ -263,6 +269,40 @@ export class LocalDemManager implements DemManager {
     );
 
     return HeightTile.fromRawDem(tile).split(subZ, x % div, y % div);
+  }
+
+  private traceLines(
+    window: DemWindow,
+    interval: number,
+    subsampleBelow: number,
+    multiplier: number,
+    extent: number,
+    buffer: number,
+  ): { [elevation: number]: number[][] } {
+    const layout = gridLayout(window, subsampleBelow, buffer);
+    if (!layout) {
+      return generateIsolines(
+        interval,
+        gridByClosureChain(demByClosures(window), subsampleBelow, multiplier),
+        extent,
+        buffer,
+      );
+    }
+    const tileHeights = tileHeightsUnlessEmpty(
+      window,
+      layout,
+      multiplier,
+      interval,
+    );
+    return tileHeights
+      ? linesByElevation(
+          followContours(
+            interval,
+            tileHeights.heights,
+            extent / tileHeights.cells,
+          ),
+        )
+      : {};
   }
 
   fetchContourTile(
@@ -298,6 +338,7 @@ export class LocalDemManager implements DemManager {
           x,
           y,
           subsampleBelow,
+          buffer,
           childAbortController,
           timer,
         );
@@ -306,16 +347,14 @@ export class LocalDemManager implements DemManager {
         }
         const mark = timer?.marker("isoline");
 
-        const virtualTile = heightGridUnlessEmpty(
+        const isolines = this.traceLines(
           window,
+          levels[0],
           subsampleBelow,
           multiplier,
-          levels[0],
+          extent,
+          buffer,
         );
-
-        const isolines = virtualTile
-          ? generateIsolines(levels[0], virtualTile, extent, buffer)
-          : {};
 
         mark?.();
         const result = encodeVectorTile({

@@ -19,7 +19,13 @@ export interface DemWindow {
   row: number;
 }
 
+export interface TileHeights {
+  heights: HeightBlock;
+  cells: number;
+}
+
 export interface GridLayout {
+  border: number;
   factor: number;
   cellsAcross: number;
   cellsDown: number;
@@ -37,22 +43,6 @@ export function heightGrid(
   multiplier: number,
 ): HeightTile {
   const layout = gridLayout(window, subsampleBelow);
-  return layout
-    ? gridOverDemPixels(
-        layout,
-        demPixelsUnderLayout(window, layout),
-        multiplier,
-      )
-    : gridByClosureChain(demByClosures(window), subsampleBelow, multiplier);
-}
-
-export function heightGridUnlessEmpty(
-  window: DemWindow,
-  subsampleBelow: number,
-  multiplier: number,
-  interval: number,
-): HeightTile | undefined {
-  const layout = gridLayout(window, subsampleBelow);
   if (!layout) {
     return gridByClosureChain(
       demByClosures(window),
@@ -60,10 +50,33 @@ export function heightGridUnlessEmpty(
       multiplier,
     );
   }
+  return heightTileOver(
+    gridOverDemPixels(layout, demPixelsUnderLayout(window, layout), multiplier),
+    layout.columns.first + GRID_BORDER,
+    layout.rows.first + GRID_BORDER,
+    layout.cellsAcross + 1,
+    layout.cellsDown + 1,
+  );
+}
+
+export function tileHeightsUnlessEmpty(
+  window: DemWindow,
+  layout: GridLayout,
+  multiplier: number,
+  interval: number,
+): TileHeights | undefined {
   const pixels = demPixelsUnderLayout(window, layout);
-  return convexHullHoldsNoLevel(pixels, multiplier, interval)
-    ? undefined
-    : gridOverDemPixels(layout, pixels, multiplier);
+  if (convexHullHoldsNoLevel(pixels, multiplier, interval)) {
+    return undefined;
+  }
+  return {
+    heights: {
+      columns: { first: -layout.border, count: layout.columns.count },
+      rows: { first: -layout.border, count: layout.rows.count },
+      data: gridOverDemPixels(layout, pixels, multiplier).data,
+    },
+    cells: layout.cellsAcross,
+  };
 }
 
 function demPixelsUnderLayout(
@@ -81,7 +94,7 @@ function gridOverDemPixels(
   layout: GridLayout,
   pixels: HeightBlock,
   multiplier: number,
-): HeightTile {
+): HeightBlock {
   const { factor, columns, rows } = layout;
   const grid =
     factor === 1
@@ -93,13 +106,7 @@ function gridOverDemPixels(
       gridByChaikinDoubling(pixels, factor, columns, rows, multiplier),
     );
   }
-  return heightTileOver(
-    grid,
-    columns.first + GRID_BORDER,
-    rows.first + GRID_BORDER,
-    layout.cellsAcross + 1,
-    layout.cellsDown + 1,
-  );
+  return grid;
 }
 
 export function convexHullHoldsNoLevel(
@@ -138,6 +145,7 @@ export function convexHullHoldsNoLevel(
 export function gridLayout(
   window: DemWindow,
   subsampleBelow: number,
+  border: number = GRID_BORDER,
 ): GridLayout | undefined {
   const center = centerOf(window);
   const splits = 2 ** window.depth;
@@ -148,16 +156,17 @@ export function gridLayout(
     return undefined;
   }
   return {
+    border,
     factor,
     cellsAcross,
     cellsDown,
     columns: {
-      first: window.column * cellsAcross - GRID_BORDER,
-      count: cellsAcross + 1 + 2 * GRID_BORDER,
+      first: window.column * cellsAcross - border,
+      count: cellsAcross + 1 + 2 * border,
     },
     rows: {
-      first: window.row * cellsDown - GRID_BORDER,
-      count: cellsDown + 1 + 2 * GRID_BORDER,
+      first: window.row * cellsDown - border,
+      count: cellsDown + 1 + 2 * border,
     },
   };
 }
@@ -197,8 +206,9 @@ export function demTilesUnderNeighbors(
 export function demTilesRead(
   window: DemWindow,
   subsampleBelow: number,
+  border: number = GRID_BORDER,
 ): number[] {
-  const layout = gridLayout(window, subsampleBelow);
+  const layout = gridLayout(window, subsampleBelow, border);
   if (!layout) {
     return demTilesUnderNeighbors(window.depth, window.column, window.row);
   }

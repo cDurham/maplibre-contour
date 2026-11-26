@@ -164,14 +164,15 @@ test("e2e contour tile", async () => {
 
   let xSum = 0,
     ySum = 0;
-  for (const { x, y } of geom) {
+  expect(geom[252]).toEqual(geom[0]);
+  for (const { x, y } of geom.slice(0, 252)) {
     xSum += x;
     ySum += y;
   }
-  const center = { x: Math.round(xSum / 253), y: Math.round(ySum / 253) };
+  const center = { x: Math.round(xSum / 252), y: Math.round(ySum / 252) };
   expect(center).toMatchObject({
-    x: 2049,
-    y: 2052,
+    x: 2048,
+    y: 2048,
   });
   expect(timings).toMatchObject([
     {
