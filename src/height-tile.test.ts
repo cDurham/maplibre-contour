@@ -137,3 +137,165 @@ test("subsample and average centers alignment between tiles", () => {
   expect(subsampled?.get(2, 2)).toBe(notSubsampled?.get(1, 1));
   expect(subsampled?.get(-2, -2)).toBe(notSubsampled?.get(-1, -1));
 });
+
+function randomDem(size: number, seed: number) {
+  let state = seed;
+  const next = () => {
+    state = (state * 1103515245 + 12345) % 2147483648;
+    return state / 2147483648;
+  };
+  const special = [NaN, -0, -20000, 10000, -12000, 9000];
+  return {
+    width: size,
+    height: size,
+    data: Float32Array.from({ length: size * size }, () => {
+      const pick = next();
+      return pick < 0.1
+        ? special[Math.floor(next() * special.length)]
+        : (next() - 0.3) * 4000;
+    }),
+  };
+}
+
+const plain = (tile: HeightTile) =>
+  new HeightTile(tile.width, tile.height, tile.get);
+
+function values(tile: HeightTile, buffer: number): number[] {
+  const result: number[] = [];
+  for (let y = -buffer; y < tile.height + buffer; y++) {
+    for (let x = -buffer; x < tile.width + buffer; x++) {
+      result.push(tile.get(x, y));
+    }
+  }
+  return result;
+}
+
+function randomNeighbors(size: number, seed: number, missing: number[] = []) {
+  return Array.from({ length: 9 }, (_, i) =>
+    missing.includes(i)
+      ? undefined
+      : HeightTile.fromRawDem(randomDem(size, seed + i)),
+  );
+}
+
+test.each([0, 1, 2, 3, 8, 9])(
+  "materialize neighbors with buffer %d matches reading each pixel",
+  (buffer) => {
+    for (const missing of [[], [0, 5], [4]]) {
+      const tiles = randomNeighbors(8, 7, missing);
+      const fast = HeightTile.combineNeighbors(tiles)?.materialize(buffer);
+      const slow = HeightTile.combineNeighbors(
+        tiles.map((tile) => tile && plain(tile)),
+      )?.materialize(buffer);
+      expect(fast && values(fast, buffer)).toEqual(
+        slow && values(slow, buffer),
+      );
+    }
+  },
+);
+
+test.each([
+  [1, 0, 0],
+  [1, 1, 0],
+  [2, 3, 1],
+])(
+  "materialize split %d/%d/%d neighbors matches reading each pixel",
+  (z, x, y) => {
+    const tiles = randomNeighbors(16, 11).map((tile) => tile?.split(z, x, y));
+    const fast = HeightTile.combineNeighbors(tiles)?.materialize(2);
+    const slow = HeightTile.combineNeighbors(
+      tiles.map((tile) => tile && plain(tile)),
+    )?.materialize(2);
+    expect(fast && values(fast, 2)).toEqual(slow && values(slow, 2));
+  },
+);
+
+test.each([
+  [1, 1, 2],
+  [3.28084, 1, 2],
+  [0.3048, 0, 1],
+  [3.28084, 2, 3],
+  [3.28084, 2, 2],
+])(
+  "average, scale by %d and materialize(%d) after materialize(%d) matches reading each pixel",
+  (multiplier, buffer, sourceBuffer) => {
+    const source = HeightTile.combineNeighbors(
+      randomNeighbors(8, 3),
+    )?.materialize(sourceBuffer);
+    const fast = source
+      ?.averagePixelCentersToGrid()
+      .scaleElevation(multiplier)
+      .materialize(buffer);
+    const slow =
+      source &&
+      plain(source)
+        .averagePixelCentersToGrid()
+        .scaleElevation(multiplier)
+        .materialize(buffer);
+    expect(fast && values(fast, buffer)).toEqual(slow && values(slow, buffer));
+  },
+);
+
+test.each([0, 1, 2, 3])(
+  "materialize(%d) of a tile materialized with buffer 3 matches reading each pixel",
+  (buffer) => {
+    const source = HeightTile.combineNeighbors(
+      randomNeighbors(8, 5),
+    )?.materialize(3);
+    const fast = source?.materialize(buffer);
+    const slow = source && plain(source).materialize(buffer);
+    expect(fast && values(fast, buffer)).toEqual(slow && values(slow, buffer));
+  },
+);
+
+test("materialize of a tile already materialized with that buffer is the tile", () => {
+  const source = HeightTile.combineNeighbors(
+    randomNeighbors(8, 5),
+  )?.materialize(2);
+  expect(source?.materialize(2)).toBe(source);
+  expect(source?.materialize(1)).not.toBe(source);
+});
+
+test.each([
+  [0, 0, 0],
+  [1, 1, 0],
+  [2, 3, 1],
+])(
+  "materialize a raw tile split %d/%d/%d matches reading each pixel",
+  (z, x, y) => {
+    const tile = HeightTile.fromRawDem(randomDem(16, 13)).split(z, x, y);
+    expect(values(tile.materialize(0), 0)).toEqual(
+      values(plain(tile).materialize(0), 0),
+    );
+  },
+);
+
+test.each([0, 1, 3])("toArray(%d) holds every value, row by row", (buffer) => {
+  const tile = HeightTile.combineNeighbors(randomNeighbors(8, 17));
+  expect(tile && Array.from(tile.toArray(buffer))).toEqual(
+    tile && values(tile, buffer),
+  );
+});
+
+test("toArray of a materialized tile is the array it serves from", () => {
+  const tile = HeightTile.combineNeighbors(randomNeighbors(8, 17))?.materialize(
+    2,
+  );
+  expect(tile?.toArray(2)).toBe(tile?.toArray(2));
+});
+
+test("fromArray serves the array inside its buffer and `outside` past it", () => {
+  const source = HeightTile.combineNeighbors(randomNeighbors(8, 19));
+  const data = source?.toArray(2) ?? new Float32Array();
+  const tile = HeightTile.fromArray(8, 8, data, 2, (x, y) => x * 100 + y);
+  expect(values(tile, 2)).toEqual(source && values(source, 2));
+  expect(tile.get(-3, 0)).toBe(-300);
+  expect(tile.get(0, 10)).toBe(10);
+  expect(HeightTile.fromArray(8, 8, data, 2).get(10, 0)).toBeNaN();
+  expect(tile.materialize(2)).toBe(tile);
+  expect(tile.toArray(2)).toBe(data);
+});
+
+test("fromArray refuses an array of the wrong size", () => {
+  expect(() => HeightTile.fromArray(8, 8, new Float32Array(64), 1)).toThrow();
+});

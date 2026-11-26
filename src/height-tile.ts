@@ -6,11 +6,48 @@ function defaultIsValid(number: number): boolean {
   return !isNaN(number) && number >= MIN_VALID_M && number <= MAX_VALID_M;
 }
 
+interface Pixels {
+  data: Float32Array;
+  offset: number;
+  stride: number;
+  buffer: number;
+  raw: boolean;
+}
+
+interface Average {
+  pixels: Pixels;
+  multiplier: number;
+}
+
+function copyRow(
+  pixels: Pixels | undefined,
+  x: number,
+  y: number,
+  length: number,
+  out: Float32Array,
+  start: number,
+) {
+  if (!pixels) {
+    out.fill(NaN, start, start + length);
+    return;
+  }
+  const from = pixels.offset + y * pixels.stride + x;
+  out.set(pixels.data.subarray(from, from + length), start);
+  if (pixels.raw) {
+    for (let i = start; i < start + length; i++) {
+      if (!defaultIsValid(out[i])) out[i] = NaN;
+    }
+  }
+}
+
 /** A tile containing elevation values aligned to a grid. */
 export class HeightTile {
   get: (x: number, y: number) => number;
   width: number;
   height: number;
+  private pixels?: Pixels;
+  private neighbors?: (HeightTile | undefined)[];
+  private average?: Average;
   constructor(
     width: number,
     height: number,
@@ -23,10 +60,51 @@ export class HeightTile {
 
   /** Construct a height tile from raw DEM pixel values */
   static fromRawDem(demTile: DemTile): HeightTile {
-    return new HeightTile(demTile.width, demTile.height, (x, y) => {
+    const tile = new HeightTile(demTile.width, demTile.height, (x, y) => {
       const value = demTile.data[y * demTile.width + x];
       return defaultIsValid(value) ? value : NaN;
     });
+    tile.pixels = {
+      data: demTile.data,
+      offset: 0,
+      stride: demTile.width,
+      buffer: 0,
+      raw: true,
+    };
+    return tile;
+  }
+
+  /**
+   * Construct a height tile from values already computed: `data` holds every value from
+   * `-buffer, -buffer` to `width + buffer, height + buffer`, row by row. Anything further
+   * out is read from `outside`, which is `NaN` everywhere unless given.
+   */
+  static fromArray(
+    width: number,
+    height: number,
+    data: Float32Array,
+    buffer: number = 0,
+    outside: (x: number, y: number) => number = () => NaN,
+  ): HeightTile {
+    const stride = width + 2 * buffer;
+    if (data.length !== stride * (height + 2 * buffer)) {
+      throw new Error(
+        "data must hold (width + 2 * buffer) * (height + 2 * buffer) values",
+      );
+    }
+    const tile = new HeightTile(width, height, (x, y) =>
+      x >= -buffer && x < width + buffer && y >= -buffer && y < height + buffer
+        ? data[(y + buffer) * stride + x + buffer]
+        : outside(x, y),
+    );
+    tile.pixels = {
+      data,
+      offset: buffer * stride + buffer,
+      stride,
+      buffer,
+      raw: false,
+    };
+    return tile;
   }
 
   /**
@@ -47,7 +125,7 @@ export class HeightTile {
     }
     const width = mainTile.width;
     const height = mainTile.height;
-    return new HeightTile(width, height, (x, y) => {
+    const tile = new HeightTile(width, height, (x, y) => {
       let gridIdx = 0;
       if (y < 0) {
         y += height;
@@ -68,6 +146,18 @@ export class HeightTile {
       const grid = neighbors[gridIdx];
       return grid ? grid.get(x, y) : NaN;
     });
+    if (
+      neighbors.every(
+        (neighbor) =>
+          !neighbor ||
+          (neighbor.pixels &&
+            neighbor.width === width &&
+            neighbor.height === height),
+      )
+    ) {
+      tile.neighbors = neighbors;
+    }
+    return tile;
   }
 
   /**
@@ -78,9 +168,18 @@ export class HeightTile {
     const by = 1 << subz;
     const dx = (subx * this.width) / by;
     const dy = (suby * this.height) / by;
-    return new HeightTile(this.width / by, this.height / by, (x, y) =>
+    const tile = new HeightTile(this.width / by, this.height / by, (x, y) =>
       this.get(x + dx, y + dy),
     );
+    const pixels = this.pixels;
+    if (pixels && [dx, dy, tile.width, tile.height].every(Number.isInteger)) {
+      tile.pixels = {
+        ...pixels,
+        offset: pixels.offset + dy * pixels.stride + dx,
+        buffer: 0,
+      };
+    }
+    return tile;
   };
 
   /**
@@ -117,8 +216,8 @@ export class HeightTile {
    * returns a new tile where values are the height at the top-left of each pixel by averaging
    * the 4 adjacent pixel values.
    */
-  averagePixelCentersToGrid = (radius: number = 1): HeightTile =>
-    new HeightTile(this.width + 1, this.height + 1, (x, y) => {
+  averagePixelCentersToGrid = (radius: number = 1): HeightTile => {
+    const tile = new HeightTile(this.width + 1, this.height + 1, (x, y) => {
       let sum = 0,
         count = 0,
         v = 0;
@@ -132,16 +231,25 @@ export class HeightTile {
       }
       return count === 0 ? NaN : sum / count;
     });
+    if (radius === 1 && this.pixels && !this.pixels.raw) {
+      tile.average = { pixels: this.pixels, multiplier: 1 };
+    }
+    return tile;
+  };
 
   /** Returns a new tile with elevation values scaled by `multiplier`. */
-  scaleElevation = (multiplier: number): HeightTile =>
-    multiplier === 1
-      ? this
-      : new HeightTile(
-          this.width,
-          this.height,
-          (x, y) => this.get(x, y) * multiplier,
-        );
+  scaleElevation = (multiplier: number): HeightTile => {
+    if (multiplier === 1) return this;
+    const tile = new HeightTile(
+      this.width,
+      this.height,
+      (x, y) => this.get(x, y) * multiplier,
+    );
+    if (this.average?.multiplier === 1) {
+      tile.average = { ...this.average, multiplier };
+    }
+    return tile;
+  };
 
   /**
    * Precompute every value from `-bufer, -buffer` to `width + buffer, height + buffer` and serve them
@@ -150,17 +258,132 @@ export class HeightTile {
    */
   materialize = (buffer: number = 2): HeightTile => {
     const stride = this.width + 2 * buffer;
-    const data = new Float32Array(stride * (this.height + 2 * buffer));
-    let idx = 0;
-    for (let y = -buffer; y < this.height + buffer; y++) {
-      for (let x = -buffer; x < this.width + buffer; x++) {
-        data[idx++] = this.get(x, y);
+    const size = stride * (this.height + 2 * buffer);
+    const own = this.pixels;
+    if (
+      own &&
+      !own.raw &&
+      own.buffer === buffer &&
+      own.stride === stride &&
+      own.offset === buffer * stride + buffer &&
+      own.data.length === size
+    ) {
+      return this;
+    }
+    const data = new Float32Array(size);
+    if (
+      !this.copyOwn(data, buffer) &&
+      !this.copyNeighbors(data, buffer) &&
+      !this.fillAverage(data, buffer)
+    ) {
+      let idx = 0;
+      for (let y = -buffer; y < this.height + buffer; y++) {
+        for (let x = -buffer; x < this.width + buffer; x++) {
+          data[idx++] = this.get(x, y);
+        }
       }
     }
-    return new HeightTile(
+    const tile = new HeightTile(
       this.width,
       this.height,
       (x, y) => data[(y + buffer) * stride + x + buffer],
     );
+    tile.pixels = {
+      data,
+      offset: buffer * stride + buffer,
+      stride,
+      buffer,
+      raw: false,
+    };
+    return tile;
   };
+
+  /**
+   * Every value from `-buffer, -buffer` to `width + buffer, height + buffer`, row by row.
+   * The array may be the one this tile serves its values from, so treat it as read-only.
+   */
+  toArray = (buffer: number = 0): Float32Array => {
+    const pixels = this.materialize(buffer).pixels;
+    if (!pixels) throw new Error("materialize left no values");
+    return pixels.data;
+  };
+
+  private copyOwn(data: Float32Array, buffer: number): boolean {
+    const pixels = this.pixels;
+    if (!pixels || buffer > pixels.buffer) return false;
+    const length = this.width + 2 * buffer;
+    let idx = 0;
+    for (let y = -buffer; y < this.height + buffer; y++) {
+      copyRow(pixels, -buffer, y, length, data, idx);
+      idx += length;
+    }
+    return true;
+  }
+
+  private copyNeighbors(data: Float32Array, buffer: number): boolean {
+    const { neighbors, width, height } = this;
+    if (!neighbors || buffer > width || buffer > height) return false;
+    let idx = 0;
+    for (let y = -buffer; y < height + buffer; y++) {
+      const west = y < 0 ? 0 : y < height ? 3 : 6;
+      const tileY = y < 0 ? y + height : y < height ? y : y - height;
+      copyRow(
+        neighbors[west]?.pixels,
+        width - buffer,
+        tileY,
+        buffer,
+        data,
+        idx,
+      );
+      copyRow(neighbors[west + 1]?.pixels, 0, tileY, width, data, idx + buffer);
+      copyRow(
+        neighbors[west + 2]?.pixels,
+        0,
+        tileY,
+        buffer,
+        data,
+        idx + buffer + width,
+      );
+      idx += width + 2 * buffer;
+    }
+    return true;
+  }
+
+  private fillAverage(data: Float32Array, buffer: number): boolean {
+    const average = this.average;
+    if (!average || buffer >= average.pixels.buffer) {
+      return false;
+    }
+    const { data: source, offset, stride } = average.pixels;
+    const multiplier = average.multiplier;
+    const width = this.width + 2 * buffer;
+    const height = this.height + 2 * buffer;
+    let idx = 0;
+    for (let row = 0; row < height; row++) {
+      let at = offset + (row - buffer - 1) * stride - buffer - 1;
+      for (let col = 0; col < width; col++, at++) {
+        let sum = 0,
+          count = 0,
+          v = 0;
+        if (!isNaN((v = source[at]))) {
+          count++;
+          sum += v;
+        }
+        if (!isNaN((v = source[at + stride]))) {
+          count++;
+          sum += v;
+        }
+        if (!isNaN((v = source[at + 1]))) {
+          count++;
+          sum += v;
+        }
+        if (!isNaN((v = source[at + stride + 1]))) {
+          count++;
+          sum += v;
+        }
+        data[idx++] = (count === 0 ? NaN : sum / count) * multiplier;
+      }
+    }
+    return true;
+  }
 }
