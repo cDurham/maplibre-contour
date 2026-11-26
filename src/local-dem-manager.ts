@@ -1,7 +1,12 @@
 import AsyncCache from "./cache";
 import defaultDecodeImage from "./decode-image";
 import { HeightTile } from "./height-tile";
-import { heightGrid } from "./height-grid";
+import {
+  demTilesRead,
+  demTilesUnderNeighbors,
+  heightGrid,
+} from "./height-grid";
+import type { DemWindow } from "./height-grid";
 import generateIsolines from "./isolines";
 import { copy, encodeIndividualOptions, isAborted, withTimeout } from "./utils";
 import type {
@@ -169,53 +174,71 @@ export class LocalDemManager implements DemManager {
   }
 
   /**
-   * The DEM under the contour tile and its 8 neighbors, at the zoom `fetchDem` uses or, when the tileset answers
+   * The DEM tiles the contour tile's height grid reads, at the zoom `fetchDem` uses or, when the tileset answers
    * that the tile under the contour tile does not exist, at the closest lower zoom down to `minzoom` that has it -
    * a sparse tileset leaves out its higher zooms where it has no data for them. A neighbor the tileset does not
    * have is left out. Both only apply when `sparse` is enabled; otherwise any failed DEM request fails the tile.
    */
-  private async fetchNeighbors(
+  private async fetchDemWindow(
     zoom: number,
     z: number,
     x: number,
     y: number,
+    subsampleBelow: number,
     abortController: AbortController,
     timer?: Timer,
-  ): Promise<(HeightTile | undefined)[]> {
-    const max = 1 << z;
-    const neighborPromises: (Promise<HeightTile | undefined> | undefined)[] =
-      [];
-    for (let iy = y - 1; iy <= y + 1; iy++) {
-      for (let ix = x - 1; ix <= x + 1; ix++) {
-        neighborPromises.push(
-          iy < 0 || iy >= max
-            ? undefined
-            : this.fetchDemAtZoom(
-                zoom,
-                z,
-                (ix + max) % max,
-                iy,
-                abortController,
-                timer,
-              ).catch((error) => {
-                if (this.sparse && isNotFound(error)) {
-                  return undefined;
-                }
-                throw error;
-              }),
-        );
-      }
+  ): Promise<DemWindow> {
+    const depth = z - zoom;
+    const splits = 1 << depth;
+    const tilesAcross = 1 << zoom;
+    const tileX = Math.floor(x / splits);
+    const tileY = Math.floor(y / splits);
+    const window: DemWindow = {
+      tiles: new Array(9).fill(undefined),
+      depth,
+      column: x % splits,
+      row: y % splits,
+    };
+    const requested = new Set<number>();
+    const fetchTiles = (tiles: number[]) =>
+      Promise.all(
+        tiles.map(async (i) => {
+          const tileRow = tileY + Math.floor(i / 3) - 1;
+          if (requested.has(i) || tileRow < 0 || tileRow >= tilesAcross) {
+            return;
+          }
+          requested.add(i);
+          window.tiles[i] = await this.fetchAndParseTile(
+            zoom,
+            (tileX + (i % 3) - 1 + tilesAcross) % tilesAcross,
+            tileRow,
+            abortController,
+            timer,
+          ).catch((error) => {
+            if (this.sparse && isNotFound(error)) {
+              return undefined;
+            }
+            throw error;
+          });
+        }),
+      );
+    await fetchTiles(demTilesUnderNeighbors(depth, window.column, window.row));
+    if (window.tiles[4]) {
+      await fetchTiles(demTilesRead(window, subsampleBelow));
+      return window;
     }
-    const neighbors = await Promise.all(neighborPromises);
-    if (
-      !this.sparse ||
-      neighbors[4] ||
-      zoom <= this.minzoom ||
-      isAborted(abortController)
-    ) {
-      return neighbors;
+    if (!this.sparse || zoom <= this.minzoom || isAborted(abortController)) {
+      return window;
     }
-    return this.fetchNeighbors(zoom - 1, z, x, y, abortController, timer);
+    return this.fetchDemWindow(
+      zoom - 1,
+      z,
+      x,
+      y,
+      subsampleBelow,
+      abortController,
+      timer,
+    );
   }
 
   private async fetchDemAtZoom(
@@ -269,21 +292,21 @@ export class LocalDemManager implements DemManager {
     const cached = this.contourCache.get(
       key,
       async (_, childAbortController) => {
-        const neighbors = await this.fetchNeighbors(
+        const window = await this.fetchDemWindow(
           this.demZoom(z, options),
           z,
           x,
           y,
+          subsampleBelow,
           childAbortController,
           timer,
         );
-        const dem = HeightTile.combineNeighbors(neighbors);
-        if (!dem || isAborted(childAbortController)) {
+        if (!window.tiles[4] || isAborted(childAbortController)) {
           return { arrayBuffer: new Uint8Array().buffer };
         }
         const mark = timer?.marker("isoline");
 
-        const virtualTile = heightGrid(dem, subsampleBelow, multiplier);
+        const virtualTile = heightGrid(window, subsampleBelow, multiplier);
 
         const isolines = generateIsolines(
           levels[0],

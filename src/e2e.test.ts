@@ -523,3 +523,23 @@ test("fetchContourTile fails on a missing DEM tile when sparse is disabled", asy
   const urls = getTile.mock.calls.map((call) => call[0]);
   expect(urls.some((url) => url.startsWith("https://example/11/"))).toBe(false);
 });
+
+test("fetchContourTile fetches the DEM tiles a window narrower than two pixels reads beyond its neighbors", async () => {
+  const getTile = jest.fn().mockResolvedValue({ data: new Blob([]) });
+  const demManager = sparseDemManager(getTile, undefined, false);
+  const contourTile = await demManager.fetchContourTile(
+    14,
+    2048 * 4 + 1,
+    2048 * 4 + 1,
+    { levels: [10], subsampleBelow: 4 },
+    new AbortController(),
+  );
+  const urls = getTile.mock.calls.map((call) => call[0]);
+  expect(urls.sort()).toEqual([
+    "https://example/12/2047/2047.png",
+    "https://example/12/2047/2048.png",
+    "https://example/12/2048/2047.png",
+    "https://example/12/2048/2048.png",
+  ]);
+  expect(contourTile.arrayBuffer.byteLength).toBeGreaterThan(0);
+});

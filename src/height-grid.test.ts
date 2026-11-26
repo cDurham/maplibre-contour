@@ -1,15 +1,22 @@
 import { HeightTile } from "./height-tile";
 import {
   chaikinDoublePixels,
-  copyDemPixels,
+  demByClosures,
+  demPixelsUnderGrid,
+  demTilesRead,
+  demTilesUnderNeighbors,
+  gatherDemPixels,
   gridByChaikinDoubling,
   gridByClosureChain,
   gridByQuadraticBSpline,
+  gridLayout,
   heightGrid,
   meanOfFourPixelsAtCorners,
+  pixelsChaikinDoublingReads,
   upsamplingFactor,
 } from "./height-grid";
-import type { HeightArray } from "./height-grid";
+import type { DemWindow, GridLayout, HeightBlock, Span } from "./height-grid";
+import type { DemTile } from "./types";
 
 type Pixels = (x: number, y: number) => number;
 
@@ -31,16 +38,24 @@ const TERRAINS: [string, Pixels, number[]][] = [
   ["fractional meters", fractional, []],
   ["whole meters with holes", withHoles(rough), []],
   ["fractional meters with holes", withHoles(fractional), []],
-  ["a missing east neighbor", rough, [5]],
-  ["only the center tile", fractional, [0, 1, 2, 3, 5, 6, 7, 8]],
+  ["a missing east DEM tile", rough, [5]],
+  ["only the center DEM tile", fractional, [0, 1, 2, 3, 5, 6, 7, 8]],
 ];
 
-function demAround(
+const WINDOWS: [string, number, number, number][] = [
+  ["the whole DEM tile", 0, 0, 0],
+  ["the northeast quarter of the DEM tile", 1, 1, 0],
+];
+
+function windowAround(
   pixels: Pixels,
-  missingNeighbors: number[] = [],
+  missingTiles: number[] = [],
+  depth: number = 0,
+  column: number = 0,
+  row: number = 0,
   width: number = WIDTH,
-): HeightTile {
-  const neighbors: (HeightTile | undefined)[] = [];
+): DemWindow {
+  const tiles: (DemTile | undefined)[] = [];
   for (let i = 0; i < 9; i++) {
     const left = ((i % 3) - 1) * width;
     const top = (Math.floor(i / 3) - 1) * width;
@@ -50,13 +65,24 @@ function demAround(
         data[y * width + x] = pixels(left + x, top + y);
       }
     }
-    neighbors.push(
-      missingNeighbors.includes(i)
-        ? undefined
-        : HeightTile.fromRawDem({ width, height: width, data }),
+    tiles.push(
+      missingTiles.includes(i) ? undefined : { width, height: width, data },
     );
   }
-  return HeightTile.combineNeighbors(neighbors) as HeightTile;
+  return { tiles, depth, column, row };
+}
+
+function without(pixels: Pixels, missingTiles: number[]): Pixels {
+  return (x, y) =>
+    missingTiles.includes(
+      (Math.floor(y / WIDTH) + 1) * 3 + Math.floor(x / WIDTH) + 1,
+    )
+      ? HOLE
+      : pixels(x, y);
+}
+
+function around(first: number, count: number, border: number): Span {
+  return { first: first - border, count: count + 2 * border };
 }
 
 function valuesOf(tile: HeightTile, border: number): Float32Array {
@@ -69,9 +95,14 @@ function valuesOf(tile: HeightTile, border: number): Float32Array {
   return Float32Array.from(values);
 }
 
-function expectSameAsTile(heights: HeightArray, tile: HeightTile) {
-  expect(heights).toMatchObject({ width: tile.width, height: tile.height });
-  expect(heights.data).toEqual(valuesOf(tile, heights.border));
+function expectSameAsTile(
+  heights: HeightBlock,
+  tile: HeightTile,
+  border: number,
+) {
+  expect(heights.columns.count).toBe(tile.width + 2 * border);
+  expect(heights.rows.count).toBe(tile.height + 2 * border);
+  expect(heights.data).toEqual(valuesOf(tile, border));
 }
 
 function mean(...values: number[]): number {
@@ -103,16 +134,40 @@ function spline(pixels: Pixels, x: number, y: number): number {
 
 function splineGrid(
   pixels: Pixels,
-  factor: number,
+  layout: GridLayout,
   multiplier: number,
 ): Float32Array {
+  const { factor, columns, rows } = layout;
   const values: number[] = [];
-  for (let y = -1; y <= WIDTH * factor + 1; y++) {
-    for (let x = -1; x <= WIDTH * factor + 1; x++) {
+  for (let y = rows.first; y < rows.first + rows.count; y++) {
+    for (let x = columns.first; x < columns.first + columns.count; x++) {
       values.push(spline(pixels, x / factor, y / factor) * multiplier);
     }
   }
   return Float32Array.from(values);
+}
+
+function splineOver(
+  window: DemWindow,
+  layout: GridLayout,
+  multiplier: number,
+): HeightBlock {
+  const { factor, columns, rows } = layout;
+  return gridByQuadraticBSpline(
+    gatherDemPixels(
+      window.tiles,
+      demPixelsUnderGrid(columns, factor),
+      demPixelsUnderGrid(rows, factor),
+    ),
+    factor,
+    columns,
+    rows,
+    multiplier,
+  );
+}
+
+function layoutOf(window: DemWindow, subsampleBelow: number): GridLayout {
+  return gridLayout(window, subsampleBelow) as GridLayout;
 }
 
 function float32Step(value: number): number {
@@ -133,46 +188,89 @@ function largestDifferenceInFloat32Steps(
 }
 
 describe("each step computes what the HeightTile method it replaces computes", () => {
-  describe.each(TERRAINS)("%s", (_, pixels, missingNeighbors) => {
-    const dem = demAround(pixels, missingNeighbors);
+  describe.each(TERRAINS)("%s", (_, pixels, missingTiles) => {
+    describe.each(WINDOWS)("%s", (_, depth, column, row) => {
+      const window = windowAround(pixels, missingTiles, depth, column, row);
+      const dem = demByClosures(window);
+      const width = WIDTH / 2 ** depth;
+      const left = column * width;
+      const top = row * width;
+      const block = gatherDemPixels(
+        window.tiles,
+        around(left, width, 2),
+        around(top, width, 2),
+      );
 
-    test("copyDemPixels is materialize(2)", () => {
-      expectSameAsTile(copyDemPixels(dem), dem.materialize(2));
-    });
+      test("demByClosures reads the DEM pixels in and around the window", () => {
+        const seen = without(pixels, missingTiles);
+        expect(dem).toMatchObject({ width, height: width });
+        for (let y = -2; y < width + 2; y++) {
+          for (let x = -2; x < width + 2; x++) {
+            expect(dem.get(x, y)).toBe(validPixel(seen, left + x, top + y));
+          }
+        }
+      });
 
-    test("chaikinDoublePixels is subsamplePixelCenters(2).materialize(2)", () => {
-      const once = chaikinDoublePixels(copyDemPixels(dem));
-      const onceBefore = dem.subsamplePixelCenters(2).materialize(2);
-      expectSameAsTile(once, onceBefore);
-      expectSameAsTile(
-        chaikinDoublePixels(once),
-        onceBefore.subsamplePixelCenters(2).materialize(2),
+      test("gatherDemPixels is fromRawDem, split, combineNeighbors and materialize(2)", () => {
+        expectSameAsTile(block, dem.materialize(2), 2);
+      });
+
+      test("chaikinDoublePixels is subsamplePixelCenters(2).materialize(2)", () => {
+        const once = chaikinDoublePixels(
+          block,
+          around(2 * left, 2 * width, 2),
+          around(2 * top, 2 * width, 2),
+        );
+        const onceBefore = dem.subsamplePixelCenters(2).materialize(2);
+        expectSameAsTile(once, onceBefore, 2);
+        expectSameAsTile(
+          chaikinDoublePixels(
+            once,
+            around(4 * left, 4 * width, 2),
+            around(4 * top, 4 * width, 2),
+          ),
+          onceBefore.subsamplePixelCenters(2).materialize(2),
+          2,
+        );
+      });
+
+      test.each([1, FEET])(
+        "meanOfFourPixelsAtCorners is averagePixelCentersToGrid().scaleElevation(%d).materialize(1)",
+        (multiplier) => {
+          expectSameAsTile(
+            meanOfFourPixelsAtCorners(
+              block,
+              around(left, width + 1, 1),
+              around(top, width + 1, 1),
+              multiplier,
+            ),
+            dem
+              .materialize(2)
+              .averagePixelCentersToGrid()
+              .scaleElevation(multiplier)
+              .materialize(1),
+            1,
+          );
+        },
+      );
+
+      test.each([1, ...FACTORS])(
+        "gridByChaikinDoubling %dx is the chain of closures",
+        (factor) => {
+          expectSameAsTile(
+            gridByChaikinDoubling(
+              block,
+              factor,
+              around(left * factor, width * factor + 1, 1),
+              around(top * factor, width * factor + 1, 1),
+              FEET,
+            ),
+            gridByClosureChain(dem, width * factor, FEET),
+            1,
+          );
+        },
       );
     });
-
-    test.each([1, FEET])(
-      "meanOfFourPixelsAtCorners is averagePixelCentersToGrid().scaleElevation(%d).materialize(1)",
-      (multiplier) => {
-        expectSameAsTile(
-          meanOfFourPixelsAtCorners(copyDemPixels(dem), multiplier),
-          dem
-            .materialize(2)
-            .averagePixelCentersToGrid()
-            .scaleElevation(multiplier)
-            .materialize(1),
-        );
-      },
-    );
-
-    test.each([1, ...FACTORS])(
-      "gridByChaikinDoubling %dx is the chain of closures",
-      (factor) => {
-        expectSameAsTile(
-          gridByChaikinDoubling(copyDemPixels(dem), factor, FEET),
-          gridByClosureChain(dem, WIDTH * factor, FEET),
-        );
-      },
-    );
   });
 });
 
@@ -182,59 +280,125 @@ test("upsamplingFactor doubles until the width reaches subsampleBelow", () => {
   expect(upsamplingFactor(64, 100)).toBe(2);
   expect(upsamplingFactor(32, 100)).toBe(4);
   expect(upsamplingFactor(1, 100)).toBe(128);
+  expect(upsamplingFactor(0.5, 100)).toBe(256);
+});
+
+test("pixelsChaikinDoublingReads is the pixels one doubling blends", () => {
+  expect(pixelsChaikinDoublingReads({ first: -2, count: 12 })).toEqual({
+    first: -2,
+    count: 8,
+  });
+  expect(pixelsChaikinDoublingReads({ first: 5, count: 1 })).toEqual({
+    first: 2,
+    count: 2,
+  });
+  expect(pixelsChaikinDoublingReads({ first: 6, count: 1 })).toEqual({
+    first: 2,
+    count: 2,
+  });
 });
 
 describe("gridByQuadraticBSpline", () => {
-  describe.each(FACTORS)("%dx", (factor) => {
-    test("is the biquadratic B-spline with the DEM pixels as control points", () => {
-      const grid = gridByQuadraticBSpline(
-        copyDemPixels(demAround(rough)),
-        factor,
-        FEET,
-      );
-      expect(grid).toMatchObject({
-        width: WIDTH * factor + 1,
-        height: WIDTH * factor + 1,
-        border: 1,
-      });
-      expect(grid.data).toEqual(splineGrid(rough, factor, FEET));
-    });
+  describe.each([
+    ...WINDOWS,
+    ["a window one pixel wide", 2, 1, 2],
+    ["a window half a pixel wide at the DEM tile's edge", 3, 7, 0],
+    ["a window an eighth of a pixel wide", 5, 9, 30],
+  ] as [string, number, number, number][])("%s", (_, depth, column, row) => {
+    const width = WIDTH / 2 ** depth;
 
-    test("is missing exactly where a pixel it blends is missing", () => {
-      const pixels = withHoles(rough);
-      const grid = gridByQuadraticBSpline(
-        copyDemPixels(demAround(pixels, [5])),
-        factor,
-        1,
-      );
-      const eastMissing: Pixels = (x, y) => (x >= WIDTH ? HOLE : pixels(x, y));
-      expect(grid.data).toEqual(splineGrid(eastMissing, factor, 1));
-    });
+    test.each(FACTORS.filter((factor) => width * factor >= 1))(
+      "%dx is the biquadratic B-spline with the DEM pixels as control points",
+      (factor) => {
+        const window = windowAround(rough, [], depth, column, row);
+        const layout = layoutOf(window, width * factor);
+        expect(layout).toMatchObject({
+          factor,
+          cellsAcross: width * factor,
+          cellsDown: width * factor,
+        });
+        expect(splineOver(window, layout, FEET).data).toEqual(
+          splineGrid(rough, layout, FEET),
+        );
+      },
+    );
+
+    test.each(FACTORS.filter((factor) => width * factor >= 1))(
+      "%dx is missing exactly where a pixel it blends is missing",
+      (factor) => {
+        const pixels = withHoles(rough);
+        const window = windowAround(pixels, [5], depth, column, row);
+        const layout = layoutOf(window, width * factor);
+        expect(splineOver(window, layout, 1).data).toEqual(
+          splineGrid(without(pixels, [5]), layout, 1),
+        );
+      },
+    );
   });
 });
 
 describe("heightGrid", () => {
-  describe.each(TERRAINS)("%s", (_, pixels, missingNeighbors) => {
-    const dem = demAround(pixels, missingNeighbors);
+  describe.each(TERRAINS)("%s", (_, pixels, missingTiles) => {
+    describe.each(WINDOWS)("%s", (_, depth, column, row) => {
+      const window = windowAround(pixels, missingTiles, depth, column, row);
+      const dem = demByClosures(window);
+      const width = WIDTH / 2 ** depth;
 
-    test("at the zoom of the DEM is the chain of closures", () => {
-      const grid = heightGrid(dem, WIDTH, FEET);
-      const before = gridByClosureChain(dem, WIDTH, FEET);
-      expect(grid).toMatchObject({ width: WIDTH + 1, height: WIDTH + 1 });
-      expect(valuesOf(grid, 1)).toEqual(valuesOf(before, 1));
+      test("at the zoom of the DEM is the chain of closures", () => {
+        const grid = heightGrid(window, width, FEET);
+        const before = gridByClosureChain(dem, width, FEET);
+        expect(grid).toMatchObject({ width: width + 1, height: width + 1 });
+        expect(valuesOf(grid, 1)).toEqual(valuesOf(before, 1));
+      });
+
+      test.each(FACTORS)(
+        "upsampled %dx is the spline, and the chain of closures where a pixel is missing",
+        (factor) => {
+          const size = width * factor;
+          const grid = valuesOf(heightGrid(window, size, FEET), 1);
+          const before = valuesOf(gridByClosureChain(dem, size, FEET), 1);
+          const direct = splineOver(window, layoutOf(window, size), FEET);
+          for (let i = 0; i < grid.length; i++) {
+            expect(grid[i]).toBe(
+              isNaN(direct.data[i]) ? before[i] : direct.data[i],
+            );
+          }
+        },
+      );
     });
 
-    test.each(FACTORS)(
-      "upsampled %dx is the spline, and the chain of closures where a pixel is missing",
-      (factor) => {
-        const size = WIDTH * factor;
-        const grid = valuesOf(heightGrid(dem, size, FEET), 1);
-        const before = valuesOf(gridByClosureChain(dem, size, FEET), 1);
-        const direct = gridByQuadraticBSpline(copyDemPixels(dem), factor, FEET);
-        for (let i = 0; i < grid.length; i++) {
-          expect(grid[i]).toBe(
-            isNaN(direct.data[i]) ? before[i] : direct.data[i],
-          );
+    test.each([
+      [2, 1],
+      [1, 2],
+      [0.5, 3],
+      [0.25, 4],
+      [0.125, 5],
+    ])(
+      "a window %d pixels wide is the same part of the whole DEM tile's grid",
+      (width, depth) => {
+        const cells = 4;
+        const factor = cells / width;
+        const whole = heightGrid(
+          windowAround(pixels, missingTiles),
+          WIDTH * factor,
+          FEET,
+        );
+        for (let row = 0; row < 2 ** depth; row++) {
+          for (let column = 0; column < 2 ** depth; column++) {
+            const part = heightGrid(
+              windowAround(pixels, missingTiles, depth, column, row),
+              cells,
+              FEET,
+            );
+            expect(part).toMatchObject({ width: cells + 1, height: cells + 1 });
+            const expected: number[] = [];
+            for (let y = -1; y <= cells + 1; y++) {
+              for (let x = -1; x <= cells + 1; x++) {
+                expected.push(whole.get(column * cells + x, row * cells + y));
+              }
+            }
+            expect(valuesOf(part, 1)).toEqual(Float32Array.from(expected));
+          }
         }
       },
     );
@@ -243,9 +407,12 @@ describe("heightGrid", () => {
   test.each([2, 4])(
     "upsampled %dx on whole meters is the chain of closures bit for bit",
     (factor) => {
-      const dem = demAround(rough);
-      expect(valuesOf(heightGrid(dem, WIDTH * factor, FEET), 1)).toEqual(
-        valuesOf(gridByClosureChain(dem, WIDTH * factor, FEET), 1),
+      const window = windowAround(rough);
+      expect(valuesOf(heightGrid(window, WIDTH * factor, FEET), 1)).toEqual(
+        valuesOf(
+          gridByClosureChain(demByClosures(window), WIDTH * factor, FEET),
+          1,
+        ),
       );
     },
   );
@@ -260,22 +427,25 @@ describe("heightGrid", () => {
     "upsampled %dx is within %d 32 bit float steps of the chain of closures",
     (factor, steps) => {
       for (const pixels of [rough, fractional, withHoles(fractional)]) {
-        const dem = demAround(pixels);
+        const window = windowAround(pixels);
         expect(
           largestDifferenceInFloat32Steps(
-            valuesOf(heightGrid(dem, WIDTH * factor, 1), 1),
-            valuesOf(gridByClosureChain(dem, WIDTH * factor, 1), 1),
+            valuesOf(heightGrid(window, WIDTH * factor, 1), 1),
+            valuesOf(
+              gridByClosureChain(demByClosures(window), WIDTH * factor, 1),
+              1,
+            ),
           ),
         ).toBeLessThanOrEqual(steps);
       }
     },
   );
 
-  test("a window that is not a whole number of pixels takes the chain of closures", () => {
-    const dem = demAround(rough).split(3, 1, 2);
-    expect(dem.width).toBe(0.5);
-    expect(valuesOf(heightGrid(dem, 4, 1), 1)).toEqual(
-      valuesOf(gridByClosureChain(dem, 4, 1), 1),
+  test("a window that does not hold a whole number of grid cells takes the chain of closures", () => {
+    const window = windowAround(rough, [], 1, 1, 0, 3);
+    expect(gridLayout(window, 1)).toBeUndefined();
+    expect(valuesOf(heightGrid(window, 1, 1), 1)).toEqual(
+      valuesOf(gridByClosureChain(demByClosures(window), 1, 1), 1),
     );
   });
 
@@ -296,14 +466,14 @@ describe("heightGrid", () => {
       "neighboring tiles upsampled %dx compute the same heights on their shared edge",
       (factor) => {
         const size = WIDTH * factor;
-        const west = heightGrid(demAround(pixels), size, FEET);
+        const west = heightGrid(windowAround(pixels), size, FEET);
         const east = heightGrid(
-          demAround((x, y) => pixels(x + WIDTH, y)),
+          windowAround((x, y) => pixels(x + WIDTH, y)),
           size,
           FEET,
         );
         const south = heightGrid(
-          demAround((x, y) => pixels(x, y + WIDTH)),
+          windowAround((x, y) => pixels(x, y + WIDTH)),
           size,
           FEET,
         );
@@ -324,9 +494,48 @@ describe("heightGrid", () => {
   });
 });
 
+describe("the DEM tiles a window reads", () => {
+  test("demTilesUnderNeighbors is the DEM tiles under the contour tile and its 8 neighbors", () => {
+    expect(demTilesUnderNeighbors(0, 0, 0)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
+    expect(demTilesUnderNeighbors(2, 1, 2)).toEqual([4]);
+    expect(demTilesUnderNeighbors(2, 0, 3)).toEqual([3, 4, 6, 7]);
+  });
+
+  test.each([
+    [0, 0, 0],
+    [1, 0, 0],
+    [1, 1, 0],
+    [1, 0, 1],
+    [1, 1, 1],
+  ])(
+    "a window two pixels wide or wider reads the DEM tiles under its neighbors (depth %d, column %d, row %d)",
+    (depth, column, row) => {
+      const window = windowAround(rough, [], depth, column, row);
+      for (const subsampleBelow of [1, 100]) {
+        expect(demTilesRead(window, subsampleBelow)).toEqual(
+          demTilesUnderNeighbors(depth, column, row),
+        );
+      }
+    },
+  );
+
+  test("a window one pixel wide reads two pixels beyond itself, into DEM tiles its neighbors are not over", () => {
+    const window = windowAround(rough, [], 2, 1, 1);
+    expect(demTilesUnderNeighbors(2, 1, 1)).toEqual([4]);
+    expect(demTilesRead(window, 100)).toEqual([0, 1, 3, 4]);
+  });
+
+  test("a window that takes the chain of closures reads the DEM tiles under its neighbors", () => {
+    const window = windowAround(rough, [], 1, 1, 0, 3);
+    expect(demTilesRead(window, 1)).toEqual(demTilesUnderNeighbors(1, 1, 0));
+  });
+});
+
 describe("the surface in plain numbers", () => {
   test("at the zoom of the DEM a grid point is the mean of the four pixels around it", () => {
-    const grid = heightGrid(demAround(rough), WIDTH, 1);
+    const grid = heightGrid(windowAround(rough), WIDTH, 1);
     for (let y = -1; y <= WIDTH + 1; y++) {
       for (let x = -1; x <= WIDTH + 1; x++) {
         expect(grid.get(x, y)).toBe(
@@ -343,7 +552,7 @@ describe("the surface in plain numbers", () => {
 
   test("a missing pixel is left out of the mean", () => {
     const pixels: Pixels = (x, y) => (x === 1 && y === 1 ? HOLE : rough(x, y));
-    const grid = heightGrid(demAround(pixels), WIDTH, 1);
+    const grid = heightGrid(windowAround(pixels), WIDTH, 1);
     expect(grid.get(1, 1)).toBe(mean(rough(0, 0), rough(1, 0), rough(0, 1)));
     expect(grid.get(2, 2)).toBe(mean(rough(2, 1), rough(1, 2), rough(2, 2)));
   });
@@ -351,14 +560,14 @@ describe("the surface in plain numbers", () => {
   test("a grid point with no pixel around it is missing", () => {
     const pixels: Pixels = (x, y) =>
       x >= 1 && x <= 2 && y >= 1 && y <= 2 ? HOLE : rough(x, y);
-    const grid = heightGrid(demAround(pixels), WIDTH, 1);
+    const grid = heightGrid(windowAround(pixels), WIDTH, 1);
     expect(grid.get(2, 2)).toBeNaN();
     expect(grid.get(1, 1)).toBe(mean(rough(0, 0), rough(1, 0), rough(0, 1)));
   });
 
-  test("a missing neighbor tile reads as missing pixels", () => {
+  test("a missing DEM tile reads as missing pixels", () => {
     const east = 5;
-    const grid = heightGrid(demAround(rough, [east]), WIDTH, 1);
+    const grid = heightGrid(windowAround(rough, [east]), WIDTH, 1);
     expect(grid.get(WIDTH, 2)).toBe(
       mean(rough(WIDTH - 1, 1), rough(WIDTH - 1, 2)),
     );
@@ -367,10 +576,19 @@ describe("the surface in plain numbers", () => {
 
   test("upsampling fills a missing pixel from the pixels on each side", () => {
     const columns: Pixels = (x) => (x === 1 ? HOLE : 100 * x);
-    const grid = heightGrid(demAround(columns, [], 2), 4, 1);
+    const grid = heightGrid(windowAround(columns, [], 0, 0, 0, 2), 4, 1);
     expect(grid.width).toBe(5);
     expect([1, 2, 3, 4, 5].map((x) => grid.get(x, 2))).toEqual([
       -12.5, 0, 100, 200, 212.5,
+    ]);
+  });
+
+  test("a window one pixel wide on a slope of 100 per pixel rises 50 per half pixel", () => {
+    const slope: Pixels = (x) => 100 * x;
+    const grid = heightGrid(windowAround(slope, [], 2, 1, 1), 2, 1);
+    expect(grid.width).toBe(3);
+    expect([-1, 0, 1, 2, 3].map((x) => grid.get(x, 1))).toEqual([
+      0, 50, 100, 150, 200,
     ]);
   });
 });

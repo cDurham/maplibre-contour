@@ -1,7 +1,7 @@
 import type { DemTile } from "./types";
 
-const MIN_VALID_M = -12000;
-const MAX_VALID_M = 9000;
+export const MIN_VALID_M = -12000;
+export const MAX_VALID_M = 9000;
 function defaultIsValid(number: number): boolean {
   return !isNaN(number) && number >= MIN_VALID_M && number <= MAX_VALID_M;
 }
